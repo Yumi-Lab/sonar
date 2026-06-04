@@ -81,6 +81,8 @@ class SonarDaemon:
         self.logger.info(f"  count: {self.config['count']}")
         self.logger.info(f"  interval: {self.config['interval']}")
         self.logger.info(f"  restart_threshold: {self.config['restart_threshold']}")
+        self.logger.info(f"  dongle_recovery: {self.config['dongle_recovery']}")
+        self.logger.info(f"  dongle_recovery_threshold: {self.config['dongle_recovery_threshold']}")
 
         # Set debug level if needed
         if self.config['debug_log']:
@@ -105,7 +107,9 @@ class SonarDaemon:
             'target': 'auto',
             'count': '3',
             'interval': '60',
-            'restart_threshold': '10'
+            'restart_threshold': '10',
+            'dongle_recovery': 'true',
+            'dongle_recovery_threshold': '3'
         }
 
         if not cp.has_section('sonar'):
@@ -118,7 +122,10 @@ class SonarDaemon:
             'target': cp.get('sonar', 'target'),
             'count': cp.getint('sonar', 'count'),
             'interval': cp.getint('sonar', 'interval'),
-            'restart_threshold': cp.getint('sonar', 'restart_threshold')
+            'restart_threshold': cp.getint('sonar', 'restart_threshold'),
+            'dongle_recovery': cp.getboolean('sonar', 'dongle_recovery'),
+            'dongle_recovery_threshold':
+                cp.getint('sonar', 'dongle_recovery_threshold')
         }
 
     def _is_service_active(self, service_name):
@@ -163,6 +170,78 @@ class SonarDaemon:
         except Exception as e:
             self.logger.error(f"Error retrieving default gateway: {e}")
             return None
+
+    def get_wifi_interface(self):
+        """Detect the first wireless network interface.
+
+        Generic and hardware agnostic: a net device is wireless if it exposes
+        a 'wireless' or 'phy80211' entry under /sys/class/net/<iface>/. Works
+        for built-in adapters (wlan0) as well as USB dongles (wlxMAC) without
+        any hardcoded name.
+        """
+        net_path = "/sys/class/net"
+        try:
+            for iface in sorted(os.listdir(net_path)):
+                dev = os.path.join(net_path, iface)
+                if os.path.exists(os.path.join(dev, "wireless")) or \
+                        os.path.exists(os.path.join(dev, "phy80211")):
+                    return iface
+        except OSError as e:
+            self.logger.error(f"Error scanning for WiFi interface: {e}")
+        return None
+
+    def reload_wifi_driver(self, interface):
+        """Last-resort recovery for a wedged WiFi adapter.
+
+        When a (usually USB) dongle locks up it stops scanning entirely and no
+        amount of 'nmcli' restarting brings it back — only re-initialising the
+        hardware does. This derives the driver from sysfs and:
+          1. rebinds the USB device (surgical, leaves other adapters alone), or
+          2. falls back to reloading the kernel module.
+        """
+        if not interface:
+            self.logger.warning("No WiFi interface found to reload.")
+            return
+
+        device = f"/sys/class/net/{interface}/device"
+
+        # 1) USB unbind/bind — most reliable for USB dongles, and it does not
+        #    touch a built-in adapter that might share the same module.
+        try:
+            driver = os.path.join(device, "driver")
+            if os.path.exists(driver):
+                drv_path = os.path.realpath(driver)
+                if "usb" in drv_path:
+                    usb_id = os.path.basename(os.path.realpath(device))
+                    self.logger.info(f"Rebinding USB WiFi {interface} "
+                                     f"({usb_id}) ...")
+                    with open(os.path.join(drv_path, "unbind"), "w") as fh:
+                        fh.write(usb_id)
+                    time.sleep(2)
+                    with open(os.path.join(drv_path, "bind"), "w") as fh:
+                        fh.write(usb_id)
+                    self.logger.info("USB rebind done.")
+                    return
+        except (OSError, IOError) as e:
+            self.logger.warning(f"USB rebind failed ({e}), "
+                                f"falling back to modprobe.")
+
+        # 2) Reload the kernel module (covers non-USB / SDIO adapters too).
+        try:
+            module = os.path.basename(
+                os.path.realpath(os.path.join(device, "driver", "module")))
+            if module and module != "module":
+                self.logger.info(f"Reloading driver module '{module}' "
+                                 f"for {interface} ...")
+                subprocess.run(["modprobe", "-r", module], check=False)
+                time.sleep(2)
+                subprocess.run(["modprobe", module], check=False)
+                self.logger.info("Driver module reloaded.")
+            else:
+                self.logger.warning(f"Could not determine driver module "
+                                    f"for {interface}.")
+        except OSError as e:
+            self.logger.error(f"Driver reload failed: {e}")
 
     def restart_wifi(self, interface="wlan0"):
         exists_wpa_cli = shutil.which("wpa_cli")
@@ -214,13 +293,38 @@ class SonarDaemon:
             self.logger.info("Sonar is disabled in the configuration. Exiting.")
             sys.exit(0)
 
+        no_gateway_cycles = 0
+
         while True:
             gateway = self.get_default_gateway()
 
             if not gateway:
-                self.logger.warning("No default gateway found. Retrying...")
+                # WiFi is fully down (no default route). Plain keepalive can
+                # do nothing here, so after a few cycles escalate recovery on
+                # the detected WiFi interface: NetworkManager restart first,
+                # then a hardware reload if the adapter is wedged (a USB
+                # dongle that no longer scans needs re-initialising).
+                no_gateway_cycles += 1
+                self.logger.warning(f"No default gateway found "
+                                    f"(cycle {no_gateway_cycles}). Retrying...")
+
+                if self.config['dongle_recovery'] and no_gateway_cycles >= \
+                        self.config['dongle_recovery_threshold']:
+                    wifi_if = self.get_wifi_interface()
+                    if wifi_if:
+                        self.logger.info(f"WiFi down for {no_gateway_cycles} "
+                                         f"cycles – escalating recovery on "
+                                         f"{wifi_if}.")
+                        self.restart_wifi(wifi_if)
+                        time.sleep(5)
+                        if not self.get_default_gateway():
+                            self.reload_wifi_driver(wifi_if)
+                    no_gateway_cycles = 0
+
                 time.sleep(self.config['interval'])
                 continue
+
+            no_gateway_cycles = 0
 
             if not gateway['interface'].startswith(('wl', 'wlan', 'wlp')):
                 self.logger.debug(f"No WiFi interface active for the default gateway."
