@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import shutil
+import socket
 import logging
 
 
@@ -81,6 +82,9 @@ class SonarDaemon:
         self.logger.info(f"  count: {self.config['count']}")
         self.logger.info(f"  interval: {self.config['interval']}")
         self.logger.info(f"  restart_threshold: {self.config['restart_threshold']}")
+        self.logger.info(f"  tcp_fallback: {self.config['tcp_fallback']}")
+        self.logger.info(f"  tcp_check_host: {self.config['tcp_check_host']}")
+        self.logger.info(f"  tcp_check_port: {self.config['tcp_check_port']}")
 
         # Set debug level if needed
         if self.config['debug_log']:
@@ -105,7 +109,10 @@ class SonarDaemon:
             'target': 'auto',
             'count': '3',
             'interval': '60',
-            'restart_threshold': '10'
+            'restart_threshold': '10',
+            'tcp_fallback': 'true',
+            'tcp_check_host': '1.1.1.1',
+            'tcp_check_port': '443'
         }
 
         if not cp.has_section('sonar'):
@@ -118,7 +125,10 @@ class SonarDaemon:
             'target': cp.get('sonar', 'target'),
             'count': cp.getint('sonar', 'count'),
             'interval': cp.getint('sonar', 'interval'),
-            'restart_threshold': cp.getint('sonar', 'restart_threshold')
+            'restart_threshold': cp.getint('sonar', 'restart_threshold'),
+            'tcp_fallback': cp.getboolean('sonar', 'tcp_fallback'),
+            'tcp_check_host': cp.get('sonar', 'tcp_check_host'),
+            'tcp_check_port': cp.getint('sonar', 'tcp_check_port')
         }
 
     def _is_service_active(self, service_name):
@@ -209,6 +219,37 @@ class SonarDaemon:
             self.logger.error(f"Error executing ping: {e}")
             return False
 
+    def tcp_check(self, host, port, timeout=3):
+        """Return True if a TCP connection to host:port can be established."""
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def is_reachable(self, target):
+        """Decide whether connectivity is up, robust to ICMP-filtered networks.
+
+        Some networks — most notably iOS/Android personal hotspots — silently
+        drop ICMP, so a failed ping does NOT mean the link is down. Restarting
+        WiFi there would tear down a perfectly working connection. Fall back to
+        a real TCP connection before declaring an outage: only when BOTH ICMP
+        and TCP fail is the network considered actually down.
+        """
+        if self.ping_target(target, self.config['count']):
+            return True
+
+        if self.config['tcp_fallback']:
+            host = self.config['tcp_check_host']
+            port = self.config['tcp_check_port']
+            if self.tcp_check(host, port):
+                self.logger.debug(f"ICMP to {target} failed but TCP "
+                                  f"{host}:{port} succeeded — link is up "
+                                  f"(ICMP filtered). Not an outage.")
+                return True
+
+        return False
+
     def run(self):
         if not self.config['enable']:
             self.logger.info("Sonar is disabled in the configuration. Exiting.")
@@ -233,7 +274,7 @@ class SonarDaemon:
             if target == "auto":
                 target = gateway['gateway']
 
-            if not self.ping_target(target, self.config['count']):
+            if not self.is_reachable(target):
                 restart_threshold = self.config['restart_threshold']
                 self.logger.info(f"Connection lost – {target} is unreachable!")
                 self.logger.info(f"Waiting {restart_threshold} seconds before"
@@ -242,8 +283,8 @@ class SonarDaemon:
 
                 retry_count = 0
                 used_retries = 0
-                # Repeat until a single ping is successful
-                while not self.ping_target(target, 1):
+                # Repeat until connectivity is restored (ICMP or TCP)
+                while not self.is_reachable(target):
                     retry_count += 1
                     used_retries += 1
                     self.restart_wifi(gateway['interface'])

@@ -81,6 +81,19 @@ Sets interval in seconds, how long it should wait for next connection check.
 
 Delay in seconds before attempting WiFi restart after connection loss
 
+    tcp_fallback: true
+
+When the ICMP ping fails, confirm the outage with a TCP connection before
+restarting WiFi. Some networks (most notably iOS/Android personal hotspots)
+silently drop ICMP while TCP keeps working — without this check, sonar would
+tear down a perfectly working connection. An outage is declared only when both
+the ICMP ping and the TCP probe fail. Set to `false` to use ICMP only.
+
+    tcp_check_host: 1.1.1.1
+    tcp_check_port: 443
+
+Host and port used for the TCP connectivity probe described above.
+
 ---
 
 That's it. It isn't the best method to keep your WiFi up and running, but it is
