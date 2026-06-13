@@ -215,6 +215,19 @@ class SonarDaemon:
 
         device = f"/sys/class/net/{interface}/device"
 
+        # Capture the module name FIRST: once the device is unbound,
+        # /sys/class/net/<iface> is gone and the name can no longer be
+        # derived — a failed rebind would then leave the adapter dead with
+        # no fallback (seen in the field: 13h without WiFi until reboot).
+        module = ""
+        try:
+            module = os.path.basename(
+                os.path.realpath(os.path.join(device, "driver", "module")))
+            if module == "module":
+                module = ""
+        except OSError:
+            pass
+
         # 1) USB unbind/bind — most reliable for USB dongles, and it does not
         #    touch a built-in adapter that might share the same module.
         try:
@@ -228,19 +241,28 @@ class SonarDaemon:
                     with open(os.path.join(drv_path, "unbind"), "w") as fh:
                         fh.write(usb_id)
                     time.sleep(2)
-                    with open(os.path.join(drv_path, "bind"), "w") as fh:
-                        fh.write(usb_id)
-                    self.logger.info("USB rebind done.")
-                    return
+                    # The bind (driver probe) can fail transiently on a
+                    # half-wedged dongle — retry before giving up on it.
+                    for attempt in range(3):
+                        try:
+                            with open(os.path.join(drv_path, "bind"),
+                                      "w") as fh:
+                                fh.write(usb_id)
+                            self.logger.info("USB rebind done.")
+                            return
+                        except (OSError, IOError) as e:
+                            self.logger.warning(
+                                f"USB bind attempt {attempt + 1}/3 "
+                                f"failed: {e}")
+                            time.sleep(3)
         except (OSError, IOError) as e:
             self.logger.warning(f"USB rebind failed ({e}), "
                                 f"falling back to modprobe.")
 
-        # 2) Reload the kernel module (covers non-USB / SDIO adapters too).
+        # 2) Reload the kernel module (covers non-USB / SDIO adapters too,
+        #    and rescues a USB rebind whose driver probe kept failing).
         try:
-            module = os.path.basename(
-                os.path.realpath(os.path.join(device, "driver", "module")))
-            if module and module != "module":
+            if module:
                 self.logger.info(f"Reloading driver module '{module}' "
                                  f"for {interface} ...")
                 subprocess.run(["modprobe", "-r", module], check=False)
@@ -271,15 +293,47 @@ class SonarDaemon:
                 self.logger.warning("wpa_cli reassociate failed or failed to"
                                     " restart dhcpcd.")
         elif is_network_manager_active:
+            # Per-device cycle first: restarting the whole NetworkManager
+            # service tears down EVERY interface (ethernet included) and
+            # races with KlipperScreen's NM monitoring — only fall back to
+            # it when the targeted reconnect doesn't work.
             try:
-                subprocess.run(["systemctl", "restart",
-                                "NetworkManager.service"], check=True)
-                self.logger.info("NetworkManager service restarted.")
+                subprocess.run(["nmcli", "device", "disconnect", interface],
+                               check=False, capture_output=True)
+                time.sleep(2)
+                subprocess.run(["nmcli", "device", "connect", interface],
+                               check=True, capture_output=True)
+                self.logger.info(f"WiFi {interface} reconnected via nmcli.")
             except subprocess.CalledProcessError:
-                self.logger.warning("Restarting NetworkManager failed.")
+                self.logger.warning(f"nmcli reconnect of {interface} failed,"
+                                    f" restarting NetworkManager.")
+                try:
+                    subprocess.run(["systemctl", "restart",
+                                    "NetworkManager.service"], check=True)
+                    self.logger.info("NetworkManager service restarted.")
+                except subprocess.CalledProcessError:
+                    self.logger.warning("Restarting NetworkManager failed.")
         else:
             self.logger.error("No active service found to restart WiFi"
                               " connection.")
+
+    def has_saved_wifi_profile(self):
+        """True if NetworkManager knows at least one WiFi connection.
+
+        Without a saved profile there is nothing to reconnect to: 'no
+        default gateway' then simply means 'WiFi not configured yet' (bench
+        pad, ethernet-only setup, first boot...). Escalating in that state
+        restarts NetworkManager and rebinds the dongle in an endless loop,
+        which is how perfectly healthy adapters end up wedged.
+        """
+        try:
+            result = subprocess.run(
+                ["nmcli", "-g", "TYPE", "connection", "show"],
+                capture_output=True, text=True, timeout=10)
+            return "802-11-wireless" in result.stdout
+        except (subprocess.SubprocessError, OSError) as e:
+            self.logger.debug(f"Could not list NM connections: {e}")
+            return True   # fail open: better to attempt recovery than never
 
     def ping_target(self, target, count):
         try:
@@ -335,6 +389,7 @@ class SonarDaemon:
             sys.exit(0)
 
         no_gateway_cycles = 0
+        recovery_rounds = 0
 
         while True:
             gateway = self.get_default_gateway()
@@ -349,10 +404,21 @@ class SonarDaemon:
                 self.logger.warning(f"No default gateway found "
                                     f"(cycle {no_gateway_cycles}). Retrying...")
 
-                if self.config['dongle_recovery'] and no_gateway_cycles >= \
-                        self.config['dongle_recovery_threshold']:
+                # Exponential backoff between recovery rounds: if recovery
+                # didn't bring a gateway back, the cause is external (AP off,
+                # no internet on the bench...) and hammering NM restarts +
+                # USB rebinds every few cycles only ends up wedging the
+                # dongle for good.
+                threshold = self.config['dongle_recovery_threshold'] * (
+                    2 ** min(recovery_rounds, 5))
+                if self.config['dongle_recovery'] and \
+                        no_gateway_cycles >= threshold:
                     wifi_if = self.get_wifi_interface()
-                    if wifi_if:
+                    if wifi_if and not self.has_saved_wifi_profile():
+                        self.logger.info(
+                            "No saved WiFi profile — nothing to reconnect "
+                            "to, skipping recovery escalation.")
+                    elif wifi_if:
                         self.logger.info(f"WiFi down for {no_gateway_cycles} "
                                          f"cycles – escalating recovery on "
                                          f"{wifi_if}.")
@@ -360,12 +426,14 @@ class SonarDaemon:
                         time.sleep(5)
                         if not self.get_default_gateway():
                             self.reload_wifi_driver(wifi_if)
+                        recovery_rounds += 1
                     no_gateway_cycles = 0
 
                 time.sleep(self.config['interval'])
                 continue
 
             no_gateway_cycles = 0
+            recovery_rounds = 0
 
             if not gateway['interface'].startswith(('wl', 'wlan', 'wlp')):
                 self.logger.debug(f"No WiFi interface active for the default gateway."
