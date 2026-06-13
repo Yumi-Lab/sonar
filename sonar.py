@@ -131,6 +131,12 @@ class SonarDaemon:
             'tcp_check_port': cp.getint('sonar', 'tcp_check_port')
         }
 
+        port = self.config['tcp_check_port']
+        if not 1 <= port <= 65535:
+            self.logger.warning(f"tcp_check_port {port} is out of range"
+                                f" (1-65535), falling back to 443.")
+            self.config['tcp_check_port'] = 443
+
     def _is_service_active(self, service_name):
         try:
             result = subprocess.run(["systemctl", "is-active", service_name],
@@ -224,7 +230,8 @@ class SonarDaemon:
         try:
             with socket.create_connection((host, int(port)), timeout=timeout):
                 return True
-        except OSError:
+        except (OSError, ValueError, OverflowError) as e:
+            self.logger.debug(f"tcp_check {host}:{port} failed: {e}")
             return False
 
     def is_reachable(self, target):
