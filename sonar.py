@@ -437,48 +437,46 @@ class SonarDaemon:
             sys.exit(0)
 
         no_gateway_cycles = 0
-        recovery_rounds = 0
 
         while True:
             gateway = self.get_default_gateway()
 
             if not gateway:
                 # WiFi is fully down (no default route). Plain keepalive can
-                # do nothing here, so after a few cycles escalate recovery on
-                # the detected WiFi interface: NetworkManager restart first,
-                # then a hardware reload if the adapter is wedged (a USB
-                # dongle that no longer scans needs re-initialising).
+                # do nothing here, so every few cycles try to recover on the
+                # detected WiFi interface: a soft nmcli reconnect, plus a
+                # hardware driver reload IF the adapter is wedged (recover_wifi
+                # only reloads when the scan returns 0 APs).
                 no_gateway_cycles += 1
                 self.logger.warning(f"No default gateway found "
                                     f"(cycle {no_gateway_cycles}). Retrying...")
 
-                # Exponential backoff between recovery rounds: if recovery
-                # didn't bring a gateway back, the cause is external (AP off,
-                # no internet on the bench...) and hammering NM restarts +
-                # USB rebinds every few cycles only ends up wedging the
-                # dongle for good.
-                threshold = self.config['dongle_recovery_threshold'] * (
-                    2 ** min(recovery_rounds, 5))
+                # FIXED low threshold — do NOT back off exponentially here.
+                # An earlier exponential backoff pushed the retry interval up
+                # to ~96 cycles (20-40 min): when the AP came back after an
+                # absence, sonar sat idle for up to half an hour before
+                # retrying, so in practice the link "never" reconnected and
+                # users rebooted. recover_wifi is cheap when the adapter scans
+                # fine (it won't reload a healthy dongle), so retry it on a
+                # short, constant cadence — the link comes back within
+                # ~threshold*interval seconds of the AP reappearing.
                 if self.config['dongle_recovery'] and \
-                        no_gateway_cycles >= threshold:
+                        no_gateway_cycles >= self.config['dongle_recovery_threshold']:
                     wifi_if = self.get_wifi_interface()
                     if wifi_if and not self.has_saved_wifi_profile():
                         self.logger.info(
                             "No saved WiFi profile — nothing to reconnect "
-                            "to, skipping recovery escalation.")
+                            "to, skipping recovery.")
                     elif wifi_if:
                         self.logger.info(f"WiFi down for {no_gateway_cycles} "
-                                         f"cycles – escalating recovery on "
-                                         f"{wifi_if}.")
+                                         f"cycles – recovering {wifi_if}.")
                         self.recover_wifi(wifi_if)
-                        recovery_rounds += 1
                     no_gateway_cycles = 0
 
                 time.sleep(self.config['interval'])
                 continue
 
             no_gateway_cycles = 0
-            recovery_rounds = 0
 
             if not gateway['interface'].startswith(('wl', 'wlan', 'wlp')):
                 self.logger.debug(f"No WiFi interface active for the default gateway."
