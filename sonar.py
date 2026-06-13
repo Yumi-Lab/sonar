@@ -317,6 +317,54 @@ class SonarDaemon:
             self.logger.error("No active service found to restart WiFi"
                               " connection.")
 
+    def wifi_scan_count(self, interface):
+        """Number of APs the adapter can see right now (forced rescan).
+
+        This is the reliable wedge detector for USB dongles (rtl8xxxu): a
+        wedged adapter is still enumerated and its radio still reads
+        'enabled', but it scans NOTHING. So '0 APs while other devices see
+        plenty' == firmware crash. Crucially this also distinguishes a dead
+        adapter (0 APs) from 'my AP is simply out of range' (still sees the
+        neighbours' APs) — so we never reload the driver just because the
+        target AP is off.
+
+        Returns the AP count, or -1 if the probe itself failed (unknown —
+        do NOT treat as wedged).
+        """
+        try:
+            r = subprocess.run(
+                ["nmcli", "-t", "-f", "BSSID", "device", "wifi", "list",
+                 "ifname", interface, "--rescan", "yes"],
+                capture_output=True, text=True, timeout=25)
+            return len([ln for ln in r.stdout.splitlines() if ln.strip()])
+        except (subprocess.SubprocessError, OSError) as e:
+            self.logger.debug(f"wifi_scan_count probe failed: {e}")
+            return -1
+
+    def recover_wifi(self, interface):
+        """Escalating recovery for one interface, wedge-aware.
+
+        1. soft reconnect (nmcli per-device, NM restart fallback)
+        2. if the adapter then still sees ZERO APs -> it's wedged, reload the
+           driver / rebind USB (reload_wifi_driver). This is the path that
+           the old 'N consecutive no-gateway cycles' trigger never reached
+           when a phantom gateway (flapping link, or a parasitic eth0) kept
+           resetting the counter — the wedge is detected directly instead.
+        """
+        self.restart_wifi(interface)
+        time.sleep(5)
+        if not self.config['dongle_recovery']:
+            return
+        n = self.wifi_scan_count(interface)
+        if n == 0:
+            self.logger.warning(f"{interface} sees 0 APs after restart — "
+                                f"adapter wedged, reloading driver.")
+            self.reload_wifi_driver(interface)
+            time.sleep(5)
+        elif n > 0:
+            self.logger.debug(f"{interface} sees {n} APs — adapter scans fine,"
+                              f" not a wedge (target AP may just be absent).")
+
     def has_saved_wifi_profile(self):
         """True if NetworkManager knows at least one WiFi connection.
 
@@ -422,10 +470,7 @@ class SonarDaemon:
                         self.logger.info(f"WiFi down for {no_gateway_cycles} "
                                          f"cycles – escalating recovery on "
                                          f"{wifi_if}.")
-                        self.restart_wifi(wifi_if)
-                        time.sleep(5)
-                        if not self.get_default_gateway():
-                            self.reload_wifi_driver(wifi_if)
+                        self.recover_wifi(wifi_if)
                         recovery_rounds += 1
                     no_gateway_cycles = 0
 
@@ -459,7 +504,12 @@ class SonarDaemon:
                 while not self.is_reachable(target):
                     retry_count += 1
                     used_retries += 1
-                    self.restart_wifi(gateway['interface'])
+                    # recover_wifi (not plain restart_wifi): if the adapter is
+                    # wedged it sees 0 APs and gets its driver reloaded. The
+                    # old restart_wifi-only loop here is exactly where a wedged
+                    # dongle with a phantom gateway spun forever on NM restarts
+                    # without ever reloading the driver.
+                    self.recover_wifi(gateway['interface'])
                     self.logger.info("Waiting 10 seconds to re-establish the connection...")
                     time.sleep(10)
                     if retry_count == 3:
