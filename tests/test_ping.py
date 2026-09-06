@@ -65,3 +65,62 @@ class Reachable(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HalfWedgedDongle(unittest.TestCase):
+    """Associated, "connected", scanning fine — but never a lease: after
+    soft_recoveries_before_reload soft reconnects without a gateway the driver is
+    reloaded even though APs are visible (bench 2026-09-06, three such drops)."""
+
+    def make(self, **options):
+        d = daemon(interval=1, dongle_recovery="true", dongle_recovery_threshold=1,
+                   soft_recoveries_before_reload=3, **options)
+        d.no_gateway_cycles = 0
+        d.soft_recoveries = 0
+        return d
+
+    def test_reload_after_three_soft_recoveries(self):
+        d = self.make()
+        with mock.patch.object(d, "get_wifi_interface", return_value="wlan0"), \
+                mock.patch.object(d, "has_saved_wifi_profile", return_value=True), \
+                mock.patch.object(d, "restart_wifi") as restart, \
+                mock.patch.object(d, "wifi_scan_count", return_value=7), \
+                mock.patch.object(d, "reload_wifi_driver") as reload, \
+                mock.patch.object(sonar.time, "sleep"):
+            self.assertFalse(d.handle_no_gateway())
+            self.assertFalse(d.handle_no_gateway())
+            reload.assert_not_called()
+            self.assertTrue(d.handle_no_gateway(), "third soft failure escalates")
+            reload.assert_called_once_with("wlan0")
+            self.assertEqual(restart.call_count, 3)
+            self.assertEqual(d.soft_recoveries, 0, "the escalation counter restarts after a reload")
+
+    def test_a_wedged_adapter_reloads_at_once(self):
+        d = self.make()
+        with mock.patch.object(d, "get_wifi_interface", return_value="wlan0"), \
+                mock.patch.object(d, "has_saved_wifi_profile", return_value=True), \
+                mock.patch.object(d, "restart_wifi"), \
+                mock.patch.object(d, "wifi_scan_count", return_value=0), \
+                mock.patch.object(d, "reload_wifi_driver") as reload, \
+                mock.patch.object(sonar.time, "sleep"):
+            self.assertTrue(d.handle_no_gateway())
+            reload.assert_called_once_with("wlan0")
+
+    def test_gateway_back_resets_the_escalation(self):
+        d = self.make()
+        d.soft_recoveries = 2
+        # the main loop resets both counters once a gateway is seen again
+        d.no_gateway_cycles = 0
+        d.soft_recoveries = 0
+        with mock.patch.object(d, "get_wifi_interface", return_value="wlan0"), \
+                mock.patch.object(d, "has_saved_wifi_profile", return_value=True), \
+                mock.patch.object(d, "restart_wifi"), \
+                mock.patch.object(d, "wifi_scan_count", return_value=7), \
+                mock.patch.object(d, "reload_wifi_driver") as reload, \
+                mock.patch.object(sonar.time, "sleep"):
+            d.handle_no_gateway()
+            reload.assert_not_called()
+
+    def test_option_is_at_least_one(self):
+        d = daemon(soft_recoveries_before_reload=0)
+        self.assertEqual(d.config["soft_recoveries_before_reload"], 1)

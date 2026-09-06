@@ -93,6 +93,26 @@ Sets interval in seconds, how long it should wait for next connection check.
 
 Delay in seconds before attempting WiFi restart after connection loss
 
+    dongle_recovery: true
+
+Recover a wedged adapter, not only a lost association: when there is no default
+route at all, every `dongle_recovery_threshold` cycles the WiFi interface is
+reconnected (`nmcli`, NetworkManager restart as fallback) and, if the adapter
+then sees no network at all, its driver is reloaded (USB unbind/bind, kernel
+module as fallback).
+
+    dongle_recovery_threshold: 3
+
+Consecutive cycles without a default route before a recovery attempt.
+
+    soft_recoveries_before_reload: 3
+
+A half-wedged USB dongle still receives (it lists the networks, associates,
+NetworkManager shows "connected") but transmits nothing: no DHCP lease, no
+default route, and soft reconnects alone loop forever. After this many soft
+recoveries in a row without a route coming back, the driver is reloaded even
+though networks are visible. Minimum 1.
+
 ---
 
 That's it. It isn't the best method to keep your WiFi up and running, but it is

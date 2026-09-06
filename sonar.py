@@ -94,6 +94,7 @@ class SonarDaemon:
         self.logger.info(f"  loss_streak: {self.config['loss_streak']}")
         self.logger.info(f"  dongle_recovery: {self.config['dongle_recovery']}")
         self.logger.info(f"  dongle_recovery_threshold: {self.config['dongle_recovery_threshold']}")
+        self.logger.info(f"  soft_recoveries_before_reload: {self.config['soft_recoveries_before_reload']}")
 
         # Set debug level if needed
         if self.config['debug_log']:
@@ -122,7 +123,8 @@ class SonarDaemon:
             'loss_threshold': '100',
             'loss_streak': '1',
             'dongle_recovery': 'true',
-            'dongle_recovery_threshold': '3'
+            'dongle_recovery_threshold': '3',
+            'soft_recoveries_before_reload': '3'
         }
 
         if not cp.has_section('sonar'):
@@ -140,7 +142,9 @@ class SonarDaemon:
             'loss_streak': max(1, cp.getint('sonar', 'loss_streak')),
             'dongle_recovery': cp.getboolean('sonar', 'dongle_recovery'),
             'dongle_recovery_threshold':
-                cp.getint('sonar', 'dongle_recovery_threshold')
+                cp.getint('sonar', 'dongle_recovery_threshold'),
+            'soft_recoveries_before_reload':
+                max(1, cp.getint('sonar', 'soft_recoveries_before_reload'))
         }
 
     def _is_service_active(self, service_name):
@@ -346,7 +350,7 @@ class SonarDaemon:
             self.logger.debug(f"wifi_scan_count probe failed: {e}")
             return -1
 
-    def recover_wifi(self, interface):
+    def recover_wifi(self, interface, force_reload=False):
         """Escalating recovery for one interface, wedge-aware.
 
         1. soft reconnect (nmcli per-device, NM restart fallback)
@@ -355,20 +359,73 @@ class SonarDaemon:
            the old 'N consecutive no-gateway cycles' trigger never reached
            when a phantom gateway (flapping link, or a parasitic eth0) kept
            resetting the counter — the wedge is detected directly instead.
+        3. force_reload: reload even though the adapter scans. A half-wedged
+           dongle still receives (it lists the APs, associates, NetworkManager
+           says "connected") but transmits nothing: no DHCP lease, no gateway,
+           and soft reconnects loop forever (bench, 2026-09-06: three drops in
+           an afternoon, each fixed only by replugging the dongle). The main
+           loop asks for it after soft_recoveries_before_reload failures.
         """
         self.restart_wifi(interface)
         time.sleep(5)
         if not self.config['dongle_recovery']:
-            return
+            return False
         n = self.wifi_scan_count(interface)
-        if n == 0:
-            self.logger.warning(f"{interface} sees 0 APs after restart — "
-                                f"adapter wedged, reloading driver.")
+        if n == 0 or force_reload:
+            self.logger.warning(
+                f"{interface} sees {n} APs after restart — "
+                + ("adapter wedged, reloading driver."
+                   if n == 0 else
+                   "associates but never gets a lease: reloading driver anyway."))
             self.reload_wifi_driver(interface)
             time.sleep(5)
-        elif n > 0:
-            self.logger.debug(f"{interface} sees {n} APs — adapter scans fine,"
-                              f" not a wedge (target AP may just be absent).")
+            return True
+        self.logger.debug(f"{interface} sees {n} APs — adapter scans fine,"
+                          f" not a wedge (target AP may just be absent).")
+        return False
+
+    def handle_no_gateway(self):
+        """One cycle without a default route (WiFi fully down, or associated
+        without a lease). Plain keepalive can do nothing here, so every
+        dongle_recovery_threshold cycles recover the detected WiFi interface:
+        a soft nmcli reconnect, plus a hardware driver reload when the adapter
+        is wedged (0 APs) — or, after soft_recoveries_before_reload soft
+        reconnects in a row that brought no gateway back, a reload anyway
+        (half-wedged dongle: associates, "connected", never any lease).
+
+        FIXED low threshold — do NOT back off exponentially here. An earlier
+        exponential backoff pushed the retry interval up to ~96 cycles (20-40
+        min): when the AP came back after an absence, sonar sat idle for up
+        to half an hour before retrying, so in practice the link "never"
+        reconnected and users rebooted. recover_wifi is cheap when the adapter
+        scans fine (it won't reload a healthy dongle before the escalation),
+        so retry it on a short, constant cadence.
+        Returns True when a hardware reload was done this cycle."""
+        self.no_gateway_cycles += 1
+        self.logger.warning(f"No default gateway found "
+                            f"(cycle {self.no_gateway_cycles}). Retrying...")
+        reloaded = False
+        if self.config['dongle_recovery'] and \
+                self.no_gateway_cycles >= self.config['dongle_recovery_threshold']:
+            wifi_if = self.get_wifi_interface()
+            if wifi_if and not self.has_saved_wifi_profile():
+                self.logger.info(
+                    "No saved WiFi profile — nothing to reconnect "
+                    "to, skipping recovery.")
+            elif wifi_if:
+                self.soft_recoveries += 1
+                force = self.soft_recoveries >= \
+                    self.config['soft_recoveries_before_reload']
+                self.logger.info(
+                    f"WiFi down for {self.no_gateway_cycles} cycles – "
+                    f"recovering {wifi_if} (soft attempt "
+                    f"{self.soft_recoveries}"
+                    + (", escalating to a driver reload)" if force else ")"))
+                reloaded = self.recover_wifi(wifi_if, force_reload=force)
+                if reloaded:
+                    self.soft_recoveries = 0
+            self.no_gateway_cycles = 0
+        return reloaded
 
     def has_saved_wifi_profile(self):
         """True if NetworkManager knows at least one WiFi connection.
@@ -420,7 +477,8 @@ class SonarDaemon:
             self.logger.info("Sonar is disabled in the configuration. Exiting.")
             sys.exit(0)
 
-        no_gateway_cycles = 0
+        self.no_gateway_cycles = 0
+        self.soft_recoveries = 0
         degraded_checks = 0
         self.last_loss = 0
 
@@ -428,41 +486,12 @@ class SonarDaemon:
             gateway = self.get_default_gateway()
 
             if not gateway:
-                # WiFi is fully down (no default route). Plain keepalive can
-                # do nothing here, so every few cycles try to recover on the
-                # detected WiFi interface: a soft nmcli reconnect, plus a
-                # hardware driver reload IF the adapter is wedged (recover_wifi
-                # only reloads when the scan returns 0 APs).
-                no_gateway_cycles += 1
-                self.logger.warning(f"No default gateway found "
-                                    f"(cycle {no_gateway_cycles}). Retrying...")
-
-                # FIXED low threshold — do NOT back off exponentially here.
-                # An earlier exponential backoff pushed the retry interval up
-                # to ~96 cycles (20-40 min): when the AP came back after an
-                # absence, sonar sat idle for up to half an hour before
-                # retrying, so in practice the link "never" reconnected and
-                # users rebooted. recover_wifi is cheap when the adapter scans
-                # fine (it won't reload a healthy dongle), so retry it on a
-                # short, constant cadence — the link comes back within
-                # ~threshold*interval seconds of the AP reappearing.
-                if self.config['dongle_recovery'] and \
-                        no_gateway_cycles >= self.config['dongle_recovery_threshold']:
-                    wifi_if = self.get_wifi_interface()
-                    if wifi_if and not self.has_saved_wifi_profile():
-                        self.logger.info(
-                            "No saved WiFi profile — nothing to reconnect "
-                            "to, skipping recovery.")
-                    elif wifi_if:
-                        self.logger.info(f"WiFi down for {no_gateway_cycles} "
-                                         f"cycles – recovering {wifi_if}.")
-                        self.recover_wifi(wifi_if)
-                    no_gateway_cycles = 0
-
+                self.handle_no_gateway()
                 time.sleep(self.config['interval'])
                 continue
 
-            no_gateway_cycles = 0
+            self.no_gateway_cycles = 0
+            self.soft_recoveries = 0
 
             if not gateway['interface'].startswith(('wl', 'wlan', 'wlp')):
                 self.logger.debug(f"No WiFi interface active for the default gateway."
