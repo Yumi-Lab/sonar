@@ -427,6 +427,35 @@ class SonarDaemon:
             self.no_gateway_cycles = 0
         return reloaded
 
+    def recover_until_reachable(self, target, interface):
+        """Recover `interface` again and again until `target` answers; returns
+        the number of attempts. recover_wifi (not plain restart_wifi): a wedged
+        adapter (0 APs) gets its driver reloaded at once. Every
+        soft_recoveries_before_reload attempts the reload is forced even though
+        the adapter scans: a half-wedged dongle keeps its association and its
+        route but transmits nothing, and soft reconnects alone never bring it
+        back (bench 2026-09-06: 46 attempts, 50 min, fixed by a replug)."""
+        n = self.config['soft_recoveries_before_reload']
+        retry_count = 0
+        used_retries = 0
+        while not self.is_reachable(target):
+            retry_count += 1
+            used_retries += 1
+            force = used_retries % n == 0
+            if force:
+                self.logger.warning(
+                    f"{used_retries} soft recoveries without a link: reloading the driver.")
+            self.recover_wifi(interface, force_reload=force)
+            self.logger.info("Waiting 10 seconds to re-establish the connection...")
+            time.sleep(10)
+            if retry_count == 3:
+                self.logger.warning(
+                    f"Reconnection attempt failed after {retry_count} tries."
+                    f" Pausing for {self.config['interval']} seconds.")
+                time.sleep(self.config['interval'])
+                retry_count = 0
+        return used_retries
+
     def has_saved_wifi_profile(self):
         """True if NetworkManager knows at least one WiFi connection.
 
@@ -522,27 +551,7 @@ class SonarDaemon:
                                  f" attempting a restart.")
                 time.sleep(restart_threshold)
 
-                retry_count = 0
-                used_retries = 0
-                # Repeat until connectivity is restored (ICMP ping)
-                while not self.is_reachable(target):
-                    retry_count += 1
-                    used_retries += 1
-                    # recover_wifi (not plain restart_wifi): if the adapter is
-                    # wedged it sees 0 APs and gets its driver reloaded. The
-                    # old restart_wifi-only loop here is exactly where a wedged
-                    # dongle with a phantom gateway spun forever on NM restarts
-                    # without ever reloading the driver.
-                    self.recover_wifi(gateway['interface'])
-                    self.logger.info("Waiting 10 seconds to re-establish the connection...")
-                    time.sleep(10)
-                    if retry_count == 3:
-                        self.logger.warning(
-                            f"Reconnection attempt failed after {retry_count} tries."
-                            f" Pausing for {self.config['interval']} seconds.")
-                        time.sleep(self.config['interval'])
-                        retry_count = 0
-
+                used_retries = self.recover_until_reachable(target, gateway['interface'])
                 self.logger.info(f"Reconnected after {used_retries} attempts.")
             else:
                 degraded_checks = 0

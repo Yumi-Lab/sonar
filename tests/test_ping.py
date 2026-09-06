@@ -124,3 +124,19 @@ class HalfWedgedDongle(unittest.TestCase):
     def test_option_is_at_least_one(self):
         d = daemon(soft_recoveries_before_reload=0)
         self.assertEqual(d.config["soft_recoveries_before_reload"], 1)
+
+
+class UnreachableGateway(unittest.TestCase):
+    """Route present, gateway silent (half-wedged dongle): the recovery loop must escalate to a
+    driver reload every soft_recoveries_before_reload attempts, not spin on nmcli forever
+    (bench 2026-09-06: 46 soft attempts, 50 minutes, fixed by replugging the dongle)."""
+
+    def test_every_third_attempt_reloads_the_driver(self):
+        d = daemon(interval=1, dongle_recovery="true", soft_recoveries_before_reload=3)
+        answers = [False] * 6 + [True]
+        with mock.patch.object(d, "is_reachable", side_effect=answers), \
+                mock.patch.object(d, "recover_wifi", return_value=False) as recover, \
+                mock.patch.object(sonar.time, "sleep"):
+            self.assertEqual(d.recover_until_reachable("1.2.3.4", "wlan0"), 6)
+        forced = [c.kwargs.get("force_reload") for c in recover.call_args_list]
+        self.assertEqual(forced, [False, False, True, False, False, True])

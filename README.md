@@ -108,10 +108,11 @@ Consecutive cycles without a default route before a recovery attempt.
     soft_recoveries_before_reload: 3
 
 A half-wedged USB dongle still receives (it lists the networks, associates,
-NetworkManager shows "connected") but transmits nothing: no DHCP lease, no
-default route, and soft reconnects alone loop forever. After this many soft
-recoveries in a row without a route coming back, the driver is reloaded even
-though networks are visible. Minimum 1.
+NetworkManager shows "connected", it may even keep its address and route) but
+transmits nothing, and soft reconnects alone loop forever. After this many soft
+recoveries in a row without the link coming back — whether there is no route
+at all or the gateway simply never answers — the driver is reloaded even though
+networks are visible. Minimum 1.
 
 ---
 
