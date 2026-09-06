@@ -19,9 +19,18 @@ Configuration:
     count: 3
     interval: 60
     restart_threshold: 10
+    loss_threshold: 100
+    loss_streak: 1
 
   If "auto" is set for the target, the default gateway (router IP) is determined
   automatically.
+
+  A check pings the target `count` times and reads the packet loss. The link is
+  considered lost when the loss reaches `loss_threshold` percent (100 = only when
+  no reply at all comes back, the historical behaviour) for `loss_streak`
+  consecutive checks. A WiFi link that keeps its association and its IP but
+  drops most frames (beacon loss on a marginal radio link) is only caught with a
+  threshold below 100.
 
 Note: If persistent_log is enabled, logs will be written to /var/log/sonar.log.
 """
@@ -81,6 +90,8 @@ class SonarDaemon:
         self.logger.info(f"  count: {self.config['count']}")
         self.logger.info(f"  interval: {self.config['interval']}")
         self.logger.info(f"  restart_threshold: {self.config['restart_threshold']}")
+        self.logger.info(f"  loss_threshold: {self.config['loss_threshold']}%")
+        self.logger.info(f"  loss_streak: {self.config['loss_streak']}")
         self.logger.info(f"  dongle_recovery: {self.config['dongle_recovery']}")
         self.logger.info(f"  dongle_recovery_threshold: {self.config['dongle_recovery_threshold']}")
 
@@ -108,6 +119,8 @@ class SonarDaemon:
             'count': '3',
             'interval': '60',
             'restart_threshold': '10',
+            'loss_threshold': '100',
+            'loss_streak': '1',
             'dongle_recovery': 'true',
             'dongle_recovery_threshold': '3'
         }
@@ -123,6 +136,8 @@ class SonarDaemon:
             'count': cp.getint('sonar', 'count'),
             'interval': cp.getint('sonar', 'interval'),
             'restart_threshold': cp.getint('sonar', 'restart_threshold'),
+            'loss_threshold': cp.getint('sonar', 'loss_threshold'),
+            'loss_streak': max(1, cp.getint('sonar', 'loss_streak')),
             'dongle_recovery': cp.getboolean('sonar', 'dongle_recovery'),
             'dongle_recovery_threshold':
                 cp.getint('sonar', 'dongle_recovery_threshold')
@@ -373,26 +388,32 @@ class SonarDaemon:
             self.logger.debug(f"Could not list NM connections: {e}")
             return True   # fail open: better to attempt recovery than never
 
-    def ping_target(self, target, count):
+    LOSS_RE = re.compile(r'(\d+(?:\.\d+)?)% packet loss')
+
+    def ping_loss(self, target, count):
+        """Packet loss (percent) of `count` pings to the target, None if ping could not run.
+        -W 1 bounds every lost reply to one second so a check on a dead link ends in ~count
+        seconds instead of hanging."""
         try:
-            result = subprocess.run(["ping", "-c", str(count), target],
+            result = subprocess.run(["ping", "-c", str(count), "-W", "1", target],
                                     capture_output=True, text=True)
-            if result.returncode != 0:
-                return False
-
-            if self.config['debug_log']:
-                lines = result.stdout.splitlines()
-                summary = lines[-1]
-                self.logger.debug(f"Ping to {target} successful: {summary}")
-
-            return True
         except Exception as e:
             self.logger.error(f"Error executing ping: {e}")
-            return False
+            return None
+        m = self.LOSS_RE.search(result.stdout)
+        if m is None:
+            # no summary at all (unknown host, no route): nothing came back
+            return 100
+        loss = int(float(m.group(1)))
+        if self.config['debug_log']:
+            self.logger.debug(f"Ping to {target}: {loss}% loss")
+        return loss
 
     def is_reachable(self, target):
-        """True if the target answers an ICMP ping."""
-        return self.ping_target(target, self.config['count'])
+        """True while the packet loss to the target stays under loss_threshold percent."""
+        loss = self.ping_loss(target, self.config['count'])
+        self.last_loss = 100 if loss is None else loss
+        return loss is not None and loss < self.config['loss_threshold']
 
     def run(self):
         if not self.config['enable']:
@@ -400,6 +421,8 @@ class SonarDaemon:
             sys.exit(0)
 
         no_gateway_cycles = 0
+        degraded_checks = 0
+        self.last_loss = 0
 
         while True:
             gateway = self.get_default_gateway()
@@ -453,8 +476,19 @@ class SonarDaemon:
                 target = gateway['gateway']
 
             if not self.is_reachable(target):
+                # The association and the IP may look fine while most frames are lost
+                # (beacon loss on a marginal link): act once the loss stays above the
+                # threshold for loss_streak consecutive checks, not on one bad burst.
+                degraded_checks += 1
+                if degraded_checks < self.config['loss_streak']:
+                    self.logger.info(f"Link to {target} degraded: {self.last_loss}% loss "
+                                     f"(check {degraded_checks}/{self.config['loss_streak']})")
+                    time.sleep(self.config['interval'])
+                    continue
+                degraded_checks = 0
                 restart_threshold = self.config['restart_threshold']
-                self.logger.info(f"Connection lost – {target} is unreachable!")
+                self.logger.info(f"Connection lost – {target} is unreachable "
+                                 f"({self.last_loss}% packet loss)!")
                 self.logger.info(f"Waiting {restart_threshold} seconds before"
                                  f" attempting a restart.")
                 time.sleep(restart_threshold)
@@ -481,6 +515,8 @@ class SonarDaemon:
                         retry_count = 0
 
                 self.logger.info(f"Reconnected after {used_retries} attempts.")
+            else:
+                degraded_checks = 0
 
             time.sleep(self.config['interval'])
 

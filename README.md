@@ -70,8 +70,20 @@ ping your default gateway (router).
 
     count: 3
 
-Number of pings per connection check. Multiple pings help avoid false positives
-from brief network hiccups. A check is considered failed only if all pings fail.
+Number of pings per connection check (each lost reply is bounded to one second).
+The packet loss of the check is compared with `loss_threshold`.
+
+    loss_threshold: 100
+
+Packet loss (percent) from which a check counts as failed. 100 keeps the
+historical behaviour: failed only when no reply at all comes back. A WiFi link
+that keeps its association and its IP but drops most frames (beacon loss on a
+marginal radio link) is only detected with a lower value, e.g. 50.
+
+    loss_streak: 1
+
+Number of consecutive failed checks before Sonar acts (reconnect). 2 or more
+ignores a single bad burst.
 
     interval: 60
 
