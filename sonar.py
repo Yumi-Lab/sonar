@@ -345,6 +345,11 @@ class SonarDaemon:
                 ["nmcli", "-t", "-f", "BSSID", "device", "wifi", "list",
                  "ifname", interface, "--rescan", "yes"],
                 capture_output=True, text=True, timeout=25)
+            if r.returncode != 0:
+                # nmcli refused (NetworkManager still starting, device not
+                # ready...): empty output here means "no answer", not "0 APs".
+                self.logger.debug(f"wifi_scan_count: nmcli exit {r.returncode}")
+                return -1
             return len([ln for ln in r.stdout.splitlines() if ln.strip()])
         except (subprocess.SubprocessError, OSError) as e:
             self.logger.debug(f"wifi_scan_count probe failed: {e}")
@@ -427,6 +432,16 @@ class SonarDaemon:
             self.no_gateway_cycles = 0
         return reloaded
 
+    def live_target(self, target):
+        """The address to ping now. With target "auto" it is the CURRENT default
+        gateway: once NetworkManager has moved to another network the old gateway
+        never answers again, and pinging it made sonar tear a working link down in
+        a loop (bench 2026-10-15). Without a route, keep the last one."""
+        if self.config['target'] != "auto":
+            return target
+        gateway = self.get_default_gateway()
+        return gateway['gateway'] if gateway else target
+
     def recover_until_reachable(self, target, interface):
         """Recover `interface` again and again until `target` answers; returns
         the number of attempts. recover_wifi (not plain restart_wifi): a wedged
@@ -438,7 +453,10 @@ class SonarDaemon:
         n = self.config['soft_recoveries_before_reload']
         retry_count = 0
         used_retries = 0
-        while not self.is_reachable(target):
+        while True:
+            target = self.live_target(target)
+            if self.is_reachable(target):
+                break
             retry_count += 1
             used_retries += 1
             force = used_retries % n == 0
