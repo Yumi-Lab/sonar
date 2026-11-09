@@ -21,6 +21,7 @@ Configuration:
     restart_threshold: 10
     loss_threshold: 100
     loss_streak: 1
+    deaf_timeout: 0
 
   If "auto" is set for the target, the default gateway (router IP) is determined
   automatically.
@@ -31,6 +32,14 @@ Configuration:
   consecutive checks. A WiFi link that keeps its association and its IP but
   drops most frames (beacon loss on a marginal radio link) is only caught with a
   threshold below 100.
+
+  `deaf_timeout` (seconds, 0 = off) catches a WiFi adapter that keeps its
+  association, its IP and its outgoing traffic but stops RECEIVING broadcast and
+  multicast frames: other hosts can no longer resolve its address (ARP) and the
+  host is unreachable from the network, while every check made from the host
+  itself still passes. Once the adapter has heard the network, `deaf_timeout`
+  seconds without a single inbound broadcast/multicast frame trigger a WiFi
+  reconnect.
 
 Note: If persistent_log is enabled, logs will be written to /var/log/sonar.log.
 """
@@ -43,6 +52,26 @@ import re
 import sys
 import shutil
 import logging
+import socket
+import struct
+import ctypes
+import threading
+
+# Classic BPF run by the kernel on every frame of the WiFi interface: keep only
+# INBOUND frames sent to a group address (broadcast or multicast: lowest bit of
+# the first destination byte), so the listener thread wakes up for those alone
+# and never for the host's own traffic or its unicast streams.
+ETH_P_ALL = 0x0003
+SO_ATTACH_FILTER = 26
+PACKET_OUTGOING = 4
+GROUP_RX_FILTER = [
+    (0x20, 0, 0, 0xfffff004),         # ld  packet type (SKF_AD_PKTTYPE)
+    (0x15, 3, 0, PACKET_OUTGOING),    # jeq outgoing -> drop
+    (0x30, 0, 0, 0x00000000),         # ldb first destination byte
+    (0x45, 0, 1, 0x00000001),         # jset group bit -> keep / drop
+    (0x06, 0, 0, 0x00000040),         # ret keep (64 bytes are plenty)
+    (0x06, 0, 0, 0x00000000),         # ret drop
+]
 
 
 class SonarDaemon:
@@ -66,6 +95,9 @@ class SonarDaemon:
 
         # Load configuration
         self.load_config(config_path)
+        # Inbound broadcast/multicast tracking (listen_group_frames)
+        self.last_group_rx = time.monotonic()
+        self.heard_group = False
 
         # Set up persistant logging if enabled
         if self.config['persistent_log']:
@@ -95,6 +127,7 @@ class SonarDaemon:
         self.logger.info(f"  dongle_recovery: {self.config['dongle_recovery']}")
         self.logger.info(f"  dongle_recovery_threshold: {self.config['dongle_recovery_threshold']}")
         self.logger.info(f"  soft_recoveries_before_reload: {self.config['soft_recoveries_before_reload']}")
+        self.logger.info(f"  deaf_timeout: {self.config['deaf_timeout']}")
 
         # Set debug level if needed
         if self.config['debug_log']:
@@ -124,7 +157,8 @@ class SonarDaemon:
             'loss_streak': '1',
             'dongle_recovery': 'true',
             'dongle_recovery_threshold': '3',
-            'soft_recoveries_before_reload': '3'
+            'soft_recoveries_before_reload': '3',
+            'deaf_timeout': '0'
         }
 
         if not cp.has_section('sonar'):
@@ -144,7 +178,8 @@ class SonarDaemon:
             'dongle_recovery_threshold':
                 cp.getint('sonar', 'dongle_recovery_threshold'),
             'soft_recoveries_before_reload':
-                max(1, cp.getint('sonar', 'soft_recoveries_before_reload'))
+                max(1, cp.getint('sonar', 'soft_recoveries_before_reload')),
+            'deaf_timeout': max(0, cp.getint('sonar', 'deaf_timeout'))
         }
 
     def _is_service_active(self, service_name):
@@ -432,6 +467,73 @@ class SonarDaemon:
             self.no_gateway_cycles = 0
         return reloaded
 
+    def listen_group_frames(self):
+        """Background thread: stamp every inbound broadcast/multicast frame on
+        the WiFi interface (the kernel filter GROUP_RX_FILTER drops all else).
+        Rebinds after any socket error: the interface can vanish and come back
+        when the driver is reloaded."""
+        while True:
+            interface = self.get_wifi_interface()
+            if interface is None:
+                time.sleep(self.config['interval'])
+                continue
+            try:
+                program = ctypes.create_string_buffer(b''.join(
+                    struct.pack('HBBI', *ins) for ins in GROUP_RX_FILTER))
+                sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                     socket.htons(ETH_P_ALL))
+                sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER,
+                                struct.pack('HL', len(GROUP_RX_FILTER),
+                                            ctypes.addressof(program)))
+                sock.bind((interface, 0))
+                while True:
+                    sock.recv(64)
+                    self.last_group_rx = time.monotonic()
+                    self.heard_group = True
+            except OSError as e:
+                self.logger.debug(f"Group frame listener on {interface}: {e}")
+                time.sleep(self.config['interval'])
+
+    def has_ipv4(self, interface):
+        """True when the interface holds an IPv4 address (connected)."""
+        try:
+            result = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev",
+                                     interface], capture_output=True, text=True)
+            return " inet " in result.stdout
+        except (subprocess.SubprocessError, OSError):
+            return False
+
+    def check_deafness(self):
+        """Reconnect a WiFi adapter that stopped receiving broadcast/multicast.
+
+        Seen on the RTL8188EUS (rtl8xxxu), C335 2026-11-10: associated, IP held,
+        pings to the gateway fine, unicast received, but not one broadcast frame
+        in minutes -- ARP requests for the host never arrived, so nothing on the
+        network could reach it until the host itself transmitted. A plain
+        reconnect brought broadcast reception back at once. Every other check
+        here pings FROM the host and passes, so this runs on its own, whatever
+        interface carries the default route.
+
+        The verdict needs the adapter to have heard this network since the last
+        reconnect: a network that falls silent costs one reconnect, never a
+        loop of them."""
+        timeout = self.config['deaf_timeout']
+        if timeout <= 0 or not self.heard_group:
+            return False
+        silent = time.monotonic() - self.last_group_rx
+        if silent < timeout:
+            return False
+        interface = self.get_wifi_interface()
+        if interface is None or not self.has_ipv4(interface):
+            return False
+        self.logger.warning(
+            f"{interface} heard no broadcast or multicast frame for {silent:.0f} s"
+            f" while connected: other hosts can no longer find it on the"
+            f" network (ARP). Reconnecting the WiFi.")
+        self.heard_group = False
+        self.restart_wifi(interface)
+        return True
+
     def live_target(self, target):
         """The address to ping now. With target "auto" it is the CURRENT default
         gateway: once NetworkManager has moved to another network the old gateway
@@ -528,8 +630,12 @@ class SonarDaemon:
         self.soft_recoveries = 0
         degraded_checks = 0
         self.last_loss = 0
+        if self.config['deaf_timeout'] > 0:
+            threading.Thread(target=self.listen_group_frames,
+                             daemon=True).start()
 
         while True:
+            self.check_deafness()
             gateway = self.get_default_gateway()
 
             if not gateway:
