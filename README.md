@@ -3,6 +3,11 @@
 A small Keepalive daemon for MainsailOS (or any other Raspberry Pi OS based
 Image).
 
+This is the Yumi-Lab fork of [mainsail-crew/sonar](https://github.com/mainsail-crew/sonar):
+it also recovers wedged USB WiFi dongles, lossy links and adapters that stop receiving
+broadcast frames. [YUMI_PATCHES.md](YUMI_PATCHES.md) lists every change and how to sync
+with upstream.
+
 ---
 
 ## Install
@@ -113,6 +118,20 @@ transmits nothing, and soft reconnects alone loop forever. After this many soft
 recoveries in a row without the link coming back — whether there is no route
 at all or the gateway simply never answers — the driver is reloaded even though
 networks are visible. Minimum 1.
+
+    deaf_timeout: 180
+
+An adapter can keep its association, its address and its outgoing traffic but
+stop receiving broadcast and multicast frames (seen on an RTL8188EUS with the
+rtl8xxxu driver). Other hosts can then no longer resolve its address (ARP): it
+is unreachable from the network, while every ping made from the host itself
+still passes. Sonar listens for inbound broadcast/multicast frames on the WiFi
+interface (a kernel filter, so ordinary traffic costs nothing); once the
+adapter has heard the network, this many seconds without such a frame while it
+holds an IPv4 address trigger a WiFi reconnect, whichever interface carries the
+default route. A frame must be heard again before the next verdict, so a
+network that goes quiet costs one reconnect, not a loop. On by default because
+an update never rewrites `sonar.conf`; 0 turns it off.
 
 ---
 
