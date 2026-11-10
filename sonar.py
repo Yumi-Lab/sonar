@@ -59,6 +59,7 @@ import struct
 import ctypes
 import threading
 
+# YUMI: added (deaf_timeout), see YUMI_PATCHES.md
 # Classic BPF run by the kernel on every frame of the WiFi interface: keep only
 # INBOUND frames sent to a group address (broadcast or multicast: lowest bit of
 # the first destination byte), so the listener thread wakes up for those alone
@@ -79,6 +80,7 @@ GROUP_RX_FILTER = [
 class SonarDaemon:
     """Sonar - A WiFi Keepalive Daemon"""
 
+    # YUMI: modified: logs the Yumi options; state for check_deafness, see YUMI_PATCHES.md
     def __init__(self, config_path=None):
         self.config = {}
         # Set up logging
@@ -136,6 +138,7 @@ class SonarDaemon:
             self.logger.setLevel(logging.DEBUG)
             self.logger.debug("Debug logging enabled.")
 
+    # YUMI: modified: loss_threshold, loss_streak, dongle_recovery*, soft_recoveries_before_reload, deaf_timeout, see YUMI_PATCHES.md
     def load_config(self, config_path=None):
         cp = configparser.ConfigParser(inline_comment_prefixes='#')
 
@@ -227,6 +230,7 @@ class SonarDaemon:
             self.logger.error(f"Error retrieving default gateway: {e}")
             return None
 
+    # YUMI: added, see YUMI_PATCHES.md
     def get_wifi_interface(self):
         """Detect the first wireless network interface.
 
@@ -246,6 +250,7 @@ class SonarDaemon:
             self.logger.error(f"Error scanning for WiFi interface: {e}")
         return None
 
+    # YUMI: added, see YUMI_PATCHES.md
     def reload_wifi_driver(self, interface):
         """Last-resort recovery for a wedged WiFi adapter.
 
@@ -321,6 +326,7 @@ class SonarDaemon:
         except OSError as e:
             self.logger.error(f"Driver reload failed: {e}")
 
+    # YUMI: modified: per-device nmcli reconnect before a NetworkManager restart, see YUMI_PATCHES.md
     def restart_wifi(self, interface="wlan0"):
         exists_wpa_cli = shutil.which("wpa_cli")
         is_dhcpcd_active = self._is_service_active("dhcpcd")
@@ -363,6 +369,7 @@ class SonarDaemon:
             self.logger.error("No active service found to restart WiFi"
                               " connection.")
 
+    # YUMI: added, see YUMI_PATCHES.md
     def wifi_scan_count(self, interface):
         """Number of APs the adapter can see right now (forced rescan).
 
@@ -392,6 +399,7 @@ class SonarDaemon:
             self.logger.debug(f"wifi_scan_count probe failed: {e}")
             return -1
 
+    # YUMI: added, see YUMI_PATCHES.md
     def recover_wifi(self, interface, force_reload=False):
         """Escalating recovery for one interface, wedge-aware.
 
@@ -426,6 +434,7 @@ class SonarDaemon:
                           f" not a wedge (target AP may just be absent).")
         return False
 
+    # YUMI: added, see YUMI_PATCHES.md
     def handle_no_gateway(self):
         """One cycle without a default route (WiFi fully down, or associated
         without a lease). Plain keepalive can do nothing here, so every
@@ -469,6 +478,7 @@ class SonarDaemon:
             self.no_gateway_cycles = 0
         return reloaded
 
+    # YUMI: added (deaf_timeout), see YUMI_PATCHES.md
     def listen_group_frames(self):
         """Background thread: stamp every inbound broadcast/multicast frame on
         the WiFi interface (the kernel filter GROUP_RX_FILTER drops all else).
@@ -496,6 +506,7 @@ class SonarDaemon:
                 self.logger.debug(f"Group frame listener on {interface}: {e}")
                 time.sleep(self.config['interval'])
 
+    # YUMI: added (deaf_timeout), see YUMI_PATCHES.md
     def has_ipv4(self, interface):
         """True when the interface holds an IPv4 address (connected)."""
         try:
@@ -505,6 +516,7 @@ class SonarDaemon:
         except (subprocess.SubprocessError, OSError):
             return False
 
+    # YUMI: added (deaf_timeout), see YUMI_PATCHES.md
     def check_deafness(self):
         """Reconnect a WiFi adapter that stopped receiving broadcast/multicast.
 
@@ -536,6 +548,7 @@ class SonarDaemon:
         self.restart_wifi(interface)
         return True
 
+    # YUMI: added, see YUMI_PATCHES.md
     def live_target(self, target):
         """The address to ping now. With target "auto" it is the CURRENT default
         gateway: once NetworkManager has moved to another network the old gateway
@@ -546,6 +559,7 @@ class SonarDaemon:
         gateway = self.get_default_gateway()
         return gateway['gateway'] if gateway else target
 
+    # YUMI: added, see YUMI_PATCHES.md
     def recover_until_reachable(self, target, interface):
         """Recover `interface` again and again until `target` answers; returns
         the number of attempts. recover_wifi (not plain restart_wifi): a wedged
@@ -578,6 +592,7 @@ class SonarDaemon:
                 retry_count = 0
         return used_retries
 
+    # YUMI: added, see YUMI_PATCHES.md
     def has_saved_wifi_profile(self):
         """True if NetworkManager knows at least one WiFi connection.
 
@@ -598,6 +613,7 @@ class SonarDaemon:
 
     LOSS_RE = re.compile(r'(\d+(?:\.\d+)?)% packet loss')
 
+    # YUMI: added, replaces upstream ping_target, see YUMI_PATCHES.md
     def ping_loss(self, target, count):
         """Packet loss (percent) of `count` pings to the target, None if ping could not run.
         -W 1 bounds every lost reply to one second so a check on a dead link ends in ~count
@@ -617,12 +633,14 @@ class SonarDaemon:
             self.logger.debug(f"Ping to {target}: {loss}% loss")
         return loss
 
+    # YUMI: added, see YUMI_PATCHES.md
     def is_reachable(self, target):
         """True while the packet loss to the target stays under loss_threshold percent."""
         loss = self.ping_loss(target, self.config['count'])
         self.last_loss = 100 if loss is None else loss
         return loss is not None and loss < self.config['loss_threshold']
 
+    # YUMI: modified: loss streak, no-gateway recovery, deaf check, live gateway, see YUMI_PATCHES.md
     def run(self):
         if not self.config['enable']:
             self.logger.info("Sonar is disabled in the configuration. Exiting.")

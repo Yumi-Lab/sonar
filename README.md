@@ -3,6 +3,11 @@
 A small Keepalive daemon for MainsailOS (or any other Raspberry Pi OS based
 Image).
 
+This is the Yumi-Lab fork of [mainsail-crew/sonar](https://github.com/mainsail-crew/sonar):
+it also recovers wedged USB WiFi dongles, lossy links and adapters that stop receiving
+broadcast frames. [YUMI_PATCHES.md](YUMI_PATCHES.md) lists every change and how to sync
+with upstream.
+
 ---
 
 ## Install
