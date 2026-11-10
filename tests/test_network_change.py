@@ -55,5 +55,54 @@ class ScanProbe(unittest.TestCase):
             self.assertEqual(d.wifi_scan_count("wlan0"), 2)
 
 
+class SavedNetworkAbsent(unittest.TestCase):
+    """C335 2026-11-09: carried away from its MIFI, the machine scanned the 5
+    neighbouring networks and sonar reloaded the driver 25 times anyway."""
+
+    def nmcli(self, saved_ssid, visible):
+        def run(cmd, **kw):
+            if cmd[:6] == ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"]:
+                return mock.Mock(stdout="MIFI-6BDD:802-11-wireless\nWired:802-3-ethernet\n",
+                                 returncode=0)
+            if cmd[:3] == ["nmcli", "-g", "802-11-wireless.ssid"]:
+                return mock.Mock(stdout=saved_ssid + "\n", returncode=0)
+            if cmd[:5] == ["nmcli", "-t", "-f", "SSID", "device"]:
+                return mock.Mock(stdout="".join(v + "\n" for v in visible), returncode=0)
+            return mock.Mock(stdout="", returncode=0)
+        return run
+
+    def recover(self, saved_ssid, visible, aps):
+        d = daemon(dongle_recovery="true")
+        with mock.patch("subprocess.run", side_effect=self.nmcli(saved_ssid, visible)), \
+                mock.patch.object(d, "restart_wifi"), \
+                mock.patch.object(d, "wifi_scan_count", return_value=aps), \
+                mock.patch.object(d, "reload_wifi_driver") as reload, \
+                mock.patch.object(sonar.time, "sleep"):
+            d.recover_wifi("wlan0", force_reload=True)
+        return reload
+
+    def test_no_reload_when_the_saved_network_is_out_of_range(self):
+        reload = self.recover("MIFI-6BDD", ["Neighbour", "ChinaNet-x", "Other"], 3)
+        reload.assert_not_called()
+
+    def test_reload_when_the_saved_network_is_there_but_no_lease(self):
+        reload = self.recover("MIFI-6BDD", ["Neighbour", "MIFI-6BDD"], 2)
+        reload.assert_called_once_with("wlan0")
+
+    def test_reload_when_the_adapter_sees_nothing(self):
+        reload = self.recover("MIFI-6BDD", [], 0)
+        reload.assert_called_once_with("wlan0")
+
+    def test_unknown_visibility_keeps_the_old_behaviour(self):
+        d = daemon(dongle_recovery="true")
+        with mock.patch("subprocess.run", side_effect=OSError("no nmcli")), \
+                mock.patch.object(d, "restart_wifi"), \
+                mock.patch.object(d, "wifi_scan_count", return_value=4), \
+                mock.patch.object(d, "reload_wifi_driver") as reload, \
+                mock.patch.object(sonar.time, "sleep"):
+            d.recover_wifi("wlan0", force_reload=True)
+        reload.assert_called_once_with("wlan0")
+
+
 if __name__ == "__main__":
     unittest.main()

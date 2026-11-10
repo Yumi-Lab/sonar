@@ -400,6 +400,45 @@ class SonarDaemon:
             return -1
 
     # YUMI: added, see YUMI_PATCHES.md
+    def saved_network_visible(self, interface):
+        """Whether one of NetworkManager's saved WiFi networks is in the last
+        scan of `interface`: True or False, None when it cannot be told.
+
+        "Associates but never gets a lease" was also read when the saved network
+        was simply out of range: the C335 was carried away from its MIFI on
+        2026-11-09 and sonar reloaded the RTL8188EUS driver 25 times in a row,
+        every 1.5 min, while the adapter scanned the 5 neighbouring networks
+        perfectly well."""
+        def unescape(value):
+            return value.replace('\\:', ':').strip()
+        try:
+            names = subprocess.run(
+                ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+                capture_output=True, text=True, timeout=10)
+            saved = set()
+            for line in names.stdout.splitlines():
+                name, _, ctype = line.rpartition(':')
+                if ctype != "802-11-wireless":
+                    continue
+                ssid = subprocess.run(
+                    ["nmcli", "-g", "802-11-wireless.ssid", "connection",
+                     "show", unescape(name)],
+                    capture_output=True, text=True, timeout=10)
+                if ssid.stdout.strip():
+                    saved.add(unescape(ssid.stdout))
+            scan = subprocess.run(
+                ["nmcli", "-t", "-f", "SSID", "device", "wifi", "list",
+                 "ifname", interface, "--rescan", "no"],
+                capture_output=True, text=True, timeout=10)
+            if not saved or scan.returncode != 0:
+                return None
+            visible = {unescape(l) for l in scan.stdout.splitlines() if l.strip()}
+            return bool(saved & visible)
+        except (subprocess.SubprocessError, OSError) as e:
+            self.logger.debug(f"saved_network_visible probe failed: {e}")
+            return None
+
+    # YUMI: added, see YUMI_PATCHES.md
     def recover_wifi(self, interface, force_reload=False):
         """Escalating recovery for one interface, wedge-aware.
 
@@ -421,6 +460,14 @@ class SonarDaemon:
         if not self.config['dongle_recovery']:
             return False
         n = self.wifi_scan_count(interface)
+        if n != 0 and force_reload and \
+                self.saved_network_visible(interface) is False:
+            # The adapter scans, but none of the networks it knows is around:
+            # nothing is wedged, a reload would only wear the dongle out.
+            self.logger.warning(
+                f"{interface} sees {n} APs but none of the saved networks:"
+                f" out of range, not a wedge. No driver reload.")
+            return False
         if n == 0 or force_reload:
             self.logger.warning(
                 f"{interface} sees {n} APs after restart — "

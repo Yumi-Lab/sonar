@@ -29,6 +29,7 @@ All measured on Yumi printers with USB WiFi dongles (RTL8188EUS, `rtl8xxxu`).
 | per-device `nmcli` reconnect | Restarting NetworkManager tore every interface down, ethernet included. |
 | live gateway (`live_target`) | After NetworkManager moved to another network, sonar kept pinging the old gateway and tore the working link down. |
 | no saved WiFi profile = nothing to recover | An ethernet-only machine looped on NetworkManager restarts and wedged healthy dongles. |
+| no forced driver reload when no saved network is in range | Carried away from its network, a machine scanned its neighbours fine and still got its driver reloaded 25 times in a row, every 1.5 min. |
 | `deaf_timeout` (default 180 s) | The adapter stopped receiving broadcast frames while everything else worked: ARP requests never arrived and the host was unreachable from the network. On by default because an update never rewrites `sonar.conf`. |
 
 The tests in `tests/` cover the Yumi behaviours and run without a network
