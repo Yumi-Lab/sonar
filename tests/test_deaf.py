@@ -36,10 +36,16 @@ class Deafness(unittest.TestCase):
         self.assertFalse(acted)
         restart.assert_not_called()
 
-    def test_off_by_default(self):
-        d = daemon()
-        self.assertEqual(d.config["deaf_timeout"], 0)
-        acted, restart = self._check(d, 10000)
+    def test_on_by_default(self):
+        # sonar.conf is never rewritten by an update: the default is what
+        # reaches the machines already installed.
+        self.assertEqual(daemon().config["deaf_timeout"], 180)
+        acted, restart = self._check(daemon(), 181)
+        self.assertTrue(acted)
+        restart.assert_called_once_with("wlan0")
+
+    def test_zero_turns_it_off(self):
+        acted, restart = self._check(daemon(deaf_timeout=0), 10000)
         self.assertFalse(acted)
         restart.assert_not_called()
 

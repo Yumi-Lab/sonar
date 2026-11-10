@@ -21,7 +21,7 @@ Configuration:
     restart_threshold: 10
     loss_threshold: 100
     loss_streak: 1
-    deaf_timeout: 0
+    deaf_timeout: 180
 
   If "auto" is set for the target, the default gateway (router IP) is determined
   automatically.
@@ -39,7 +39,9 @@ Configuration:
   host is unreachable from the network, while every check made from the host
   itself still passes. Once the adapter has heard the network, `deaf_timeout`
   seconds without a single inbound broadcast/multicast frame trigger a WiFi
-  reconnect.
+  reconnect. On by default: sonar.conf is written once at install and never
+  rewritten by an update, so a default is the only way an existing machine
+  gets it. 0 turns it off.
 
 Note: If persistent_log is enabled, logs will be written to /var/log/sonar.log.
 """
@@ -158,7 +160,7 @@ class SonarDaemon:
             'dongle_recovery': 'true',
             'dongle_recovery_threshold': '3',
             'soft_recoveries_before_reload': '3',
-            'deaf_timeout': '0'
+            'deaf_timeout': '180'
         }
 
         if not cp.has_section('sonar'):
