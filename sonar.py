@@ -77,8 +77,15 @@ GROUP_RX_FILTER = [
 ]
 
 
+# YUMI: added (sysfs root, tests point it at a fake tree), see YUMI_PATCHES.md
+SYS_CLASS_NET = "/sys/class/net"
+
+
 class SonarDaemon:
     """Sonar - A WiFi Keepalive Daemon"""
+
+    # YUMI: added: USB port of an adapter a reset dropped off the bus, see YUMI_PATCHES.md
+    adapter_off_bus = None
 
     # YUMI: modified: logs the Yumi options; state for check_deafness, see YUMI_PATCHES.md
     def __init__(self, config_path=None):
@@ -239,7 +246,7 @@ class SonarDaemon:
         for built-in adapters (wlan0) as well as USB dongles (wlxMAC) without
         any hardcoded name.
         """
-        net_path = "/sys/class/net"
+        net_path = SYS_CLASS_NET
         try:
             for iface in sorted(os.listdir(net_path)):
                 dev = os.path.join(net_path, iface)
@@ -264,7 +271,8 @@ class SonarDaemon:
             self.logger.warning("No WiFi interface found to reload.")
             return
 
-        device = f"/sys/class/net/{interface}/device"
+        device = os.path.join(SYS_CLASS_NET, interface, "device")
+        usb_dev = self.usb_device_of(device)
 
         # Capture the module name FIRST: once the device is unbound,
         # /sys/class/net/<iface> is gone and the name can no longer be
@@ -325,6 +333,46 @@ class SonarDaemon:
                                     f"for {interface}.")
         except OSError as e:
             self.logger.error(f"Driver reload failed: {e}")
+        self.report_off_bus(usb_dev)
+
+    # YUMI: added, see YUMI_PATCHES.md
+    def usb_device_of(self, device):
+        """The USB device behind a network adapter, as (sysfs path, "port (vid:pid)"),
+        or None for a built-in / non-USB adapter."""
+        usb_dev = os.path.realpath(os.path.join(device, ".."))
+        try:
+            with open(os.path.join(usb_dev, "idVendor")) as v, \
+                    open(os.path.join(usb_dev, "idProduct")) as p:
+                ids = f"{v.read().strip()}:{p.read().strip()}"
+        except OSError:
+            return None
+        return usb_dev, f"{os.path.basename(usb_dev)} ({ids})"
+
+    # YUMI: added, see YUMI_PATCHES.md
+    def report_off_bus(self, usb_dev):
+        """Any driver reload resets the USB device. A healthy RTL8188EUS comes back
+        within seconds, but a wedged one can fail the reset and leave the bus for good
+        (C235, 16/11/2026: bind ENODEV x3, then hours of a silent "No default gateway"
+        until the dongle was replugged). No software reload can reach it any more, so
+        say it once, plainly, with what to do."""
+        if not usb_dev or os.path.exists(usb_dev[0]):
+            return
+        self.adapter_off_bus = usb_dev[1]
+        self.logger.error(
+            f"WiFi adapter on USB port {usb_dev[1]} dropped off the bus after the reset "
+            f"and did not come back: no software reload can reach it. Unplug it and plug "
+            f"it back in (or switch the machine off and on).")
+
+    # YUMI: added, see YUMI_PATCHES.md
+    def check_adapter_back(self):
+        """Log once when an adapter that dropped off the bus is seen again."""
+        if not self.adapter_off_bus:
+            return
+        interface = self.get_wifi_interface()
+        if interface:
+            self.logger.info(f"WiFi adapter is back as {interface} "
+                             f"(it had dropped off USB port {self.adapter_off_bus}).")
+            self.adapter_off_bus = None
 
     # YUMI: modified: per-device nmcli reconnect before a NetworkManager restart, see YUMI_PATCHES.md
     def restart_wifi(self, interface="wlan0"):
@@ -702,6 +750,7 @@ class SonarDaemon:
                              daemon=True).start()
 
         while True:
+            self.check_adapter_back()  # YUMI: added, see YUMI_PATCHES.md
             self.check_deafness()
             gateway = self.get_default_gateway()
 

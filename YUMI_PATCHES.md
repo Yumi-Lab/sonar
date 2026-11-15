@@ -30,6 +30,7 @@ All measured on Yumi printers with USB WiFi dongles (RTL8188EUS, `rtl8xxxu`).
 | live gateway (`live_target`) | After NetworkManager moved to another network, sonar kept pinging the old gateway and tore the working link down. |
 | no saved WiFi profile = nothing to recover | An ethernet-only machine looped on NetworkManager restarts and wedged healthy dongles. |
 | no forced driver reload when no saved network is in range | Carried away from its network, a machine scanned its neighbours fine and still got its driver reloaded 25 times in a row, every 1.5 min. |
+| adapter off the bus reported (`report_off_bus`, `check_adapter_back`) | Every driver reload resets the USB device. A wedged RTL8188EUS failed that reset and left the bus for good: hours of a silent "No default gateway" until someone replugged it. sonar now says once that the adapter needs a replug, and says when it is back. No behaviour change, no new option. |
 | `deaf_timeout` (default 180 s) | The adapter stopped receiving broadcast frames while everything else worked: ARP requests never arrived and the host was unreachable from the network. On by default because an update never rewrites `sonar.conf`. |
 
 The tests in `tests/` cover the Yumi behaviours and run without a network
